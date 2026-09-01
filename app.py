@@ -33,9 +33,22 @@ def fetch_stooq(symbol):
 
 
 def fetch_yfinance_single(symbol):
-    """yfinance single symbol. Returns (close, prev_close)."""
+    """yfinance single symbol. Returns (price, prev_close)."""
     import yfinance as yf
     ticker = yf.Ticker(symbol)
+
+    # fast_info gives the actual live/last traded price and previous session close.
+    # Much more accurate than daily history, which only contains completed candles.
+    try:
+        fi = ticker.fast_info
+        p  = fi.last_price
+        pc = fi.previous_close
+        if p and p > 0:
+            return round(float(p), 2), (round(float(pc), 2) if pc else None)
+    except Exception:
+        pass
+
+    # Fallback: daily history
     hist = ticker.history(period='5d')
     # Drop NaN closes — at midnight yfinance may insert an empty row for the new day
     closes = hist['Close'].dropna() if not hist.empty else hist['Close']
@@ -43,6 +56,7 @@ def fetch_yfinance_single(symbol):
         return round(float(closes.iloc[-1]), 2), round(float(closes.iloc[-2]), 2)
     if len(closes) == 1:
         return round(float(closes.iloc[0]), 2), None
+
     info = ticker.info
     p  = info.get('regularMarketPrice') or info.get('currentPrice')
     pc = info.get('previousClose') or info.get('regularMarketPreviousClose')
@@ -56,7 +70,6 @@ def _fetch_one(symbol):
         p, pc, ts = _cache[symbol]
         if time.time() - ts < CACHE_TTL:
             return symbol, p, pc, True
-
     price, prev_close = None, None
     for fn in [fetch_stooq, fetch_yfinance_single]:
         try:
@@ -65,7 +78,6 @@ def _fetch_one(symbol):
                 break
         except Exception:
             continue
-
     if price is not None:
         _cache[symbol] = (price, prev_close, time.time())
     return symbol, price, prev_close, False
@@ -74,31 +86,60 @@ def _fetch_one(symbol):
 # ── Batch fetcher (used by /prices) ─────────────────────────────────────────
 
 def fetch_batch_yfinance(symbols):
-    """Single yfinance call for all symbols. Returns dict: symbol -> (close, prev_close) | None."""
+    """
+    Fetch live prices for all symbols.
+    Tries fast_info in parallel first (live price), then falls back to
+    batch history download for any that fail.
+    Returns dict: symbol -> (price, prev_close) | None.
+    """
     import yfinance as yf
     results = {s: None for s in symbols}
-    try:
-        raw = yf.download(
-            symbols,
-            period='5d',
-            group_by='ticker',
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
-        single = len(symbols) == 1
-        for sym in symbols:
-            try:
-                closes = (raw['Close'] if single else raw[sym]['Close']).dropna()
-                if len(closes) >= 2:
-                    results[sym] = (round(float(closes.iloc[-1]), 2),
-                                    round(float(closes.iloc[-2]), 2))
-                elif len(closes) == 1:
-                    results[sym] = (round(float(closes.iloc[0]), 2), None)
-            except Exception:
-                pass
-    except Exception:
-        pass
+
+    # 1. Parallel fast_info — live/last traded price + previous session close
+    def _fast(sym):
+        try:
+            fi = yf.Ticker(sym).fast_info
+            p  = fi.last_price
+            pc = fi.previous_close
+            if p and p > 0:
+                return sym, (round(float(p), 2), round(float(pc), 2) if pc else None)
+        except Exception:
+            pass
+        return sym, None
+
+    need_history = []
+    with ThreadPoolExecutor(max_workers=min(len(symbols), 10)) as ex:
+        for sym, val in ex.map(_fast, symbols):
+            if val is not None:
+                results[sym] = val
+            else:
+                need_history.append(sym)
+
+    # 2. Batch history download for any fast_info couldn't resolve
+    if need_history:
+        try:
+            raw = yf.download(
+                need_history,
+                period='5d',
+                group_by='ticker',
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+            single = len(need_history) == 1
+            for sym in need_history:
+                try:
+                    closes = (raw['Close'] if single else raw[sym]['Close']).dropna()
+                    if len(closes) >= 2:
+                        results[sym] = (round(float(closes.iloc[-1]), 2),
+                                        round(float(closes.iloc[-2]), 2))
+                    elif len(closes) == 1:
+                        results[sym] = (round(float(closes.iloc[0]), 2), None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     return results
 
 
@@ -115,9 +156,8 @@ def index():
 
 # ── History endpoint (OHLCV for charting) ────────────────────────────────────
 
-# period/interval combos supported by yfinance
-_VALID_PERIODS   = {'1mo','3mo','6mo','1y','2y','5y'}
-_VALID_INTERVALS = {'1d','1wk','1mo'}
+_VALID_PERIODS   = {'1mo', '3mo', '6mo', '1y', '2y', '5y'}
+_VALID_INTERVALS = {'1d', '1wk', '1mo'}
 
 @app.route('/history')
 def history():
@@ -128,14 +168,12 @@ def history():
         return jsonify({'error': 'symbol required'}), 400
     if period   not in _VALID_PERIODS:   period   = '1y'
     if interval not in _VALID_INTERVALS: interval = '1d'
-
     try:
         import yfinance as yf
         ticker = yf.Ticker(symbol)
         hist = ticker.history(period=period, interval=interval, auto_adjust=True)
         if hist.empty:
             return jsonify({'error': 'no data found'}), 404
-
         data = []
         for ts, row in hist.iterrows():
             o = row.get('Open');  h = row.get('High')
@@ -143,7 +181,7 @@ def history():
             v = row.get('Volume')
             # Skip rows with NaN OHLC (can appear at period edges)
             import math
-            if any(x is None or (isinstance(x, float) and math.isnan(x)) for x in [o,h,l,c]):
+            if any(x is None or (isinstance(x, float) and math.isnan(x)) for x in [o, h, l, c]):
                 continue
             data.append({
                 'time':   int(ts.timestamp()),
@@ -153,7 +191,6 @@ def history():
                 'close':  round(float(c), 2),
                 'volume': int(v) if v and not (isinstance(v, float) and math.isnan(v)) else 0,
             })
-
         return jsonify({'symbol': symbol, 'interval': interval, 'data': data})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -178,7 +215,6 @@ def prices():
         return jsonify({'error': 'symbols required'}), 400
 
     result = {}
-
     # 1. Check cache — pull out any still-fresh entries
     now = time.time()
     missing = []
@@ -195,7 +231,6 @@ def prices():
 
     # 2. Batch fetch via yfinance for all missing symbols at once
     batch = fetch_batch_yfinance(missing)
-
     still_missing = []
     for sym in missing:
         val = batch.get(sym)
