@@ -37,10 +37,12 @@ def fetch_yfinance_single(symbol):
     import yfinance as yf
     ticker = yf.Ticker(symbol)
     hist = ticker.history(period='5d')
-    if len(hist) >= 2:
-        return round(float(hist['Close'].iloc[-1]), 2), round(float(hist['Close'].iloc[-2]), 2)
-    if len(hist) == 1:
-        return round(float(hist['Close'].iloc[-1]), 2), None
+    # Drop NaN closes — at midnight yfinance may insert an empty row for the new day
+    closes = hist['Close'].dropna() if not hist.empty else hist['Close']
+    if len(closes) >= 2:
+        return round(float(closes.iloc[-1]), 2), round(float(closes.iloc[-2]), 2)
+    if len(closes) == 1:
+        return round(float(closes.iloc[0]), 2), None
     info = ticker.info
     p  = info.get('regularMarketPrice') or info.get('currentPrice')
     pc = info.get('previousClose') or info.get('regularMarketPreviousClose')
