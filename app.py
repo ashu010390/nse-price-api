@@ -108,8 +108,55 @@ def fetch_batch_yfinance(symbols):
 def index():
     return jsonify({'status': 'ok', 'endpoints': [
         '/price?symbol=TITAN.NS',
-        '/prices?symbols=TITAN.NS,INFY.NS,RELIANCE.NS'
+        '/prices?symbols=TITAN.NS,INFY.NS,RELIANCE.NS',
+        '/history?symbol=TITAN.NS&period=1y&interval=1d',
     ]})
+
+
+# ── History endpoint (OHLCV for charting) ────────────────────────────────────
+
+# period/interval combos supported by yfinance
+_VALID_PERIODS   = {'1mo','3mo','6mo','1y','2y','5y'}
+_VALID_INTERVALS = {'1d','1wk','1mo'}
+
+@app.route('/history')
+def history():
+    symbol   = request.args.get('symbol',   '').strip()
+    period   = request.args.get('period',   '1y')
+    interval = request.args.get('interval', '1d')
+    if not symbol:
+        return jsonify({'error': 'symbol required'}), 400
+    if period   not in _VALID_PERIODS:   period   = '1y'
+    if interval not in _VALID_INTERVALS: interval = '1d'
+
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period=period, interval=interval, auto_adjust=True)
+        if hist.empty:
+            return jsonify({'error': 'no data found'}), 404
+
+        data = []
+        for ts, row in hist.iterrows():
+            o = row.get('Open');  h = row.get('High')
+            l = row.get('Low');   c = row.get('Close')
+            v = row.get('Volume')
+            # Skip rows with NaN OHLC (can appear at period edges)
+            import math
+            if any(x is None or (isinstance(x, float) and math.isnan(x)) for x in [o,h,l,c]):
+                continue
+            data.append({
+                'time':   int(ts.timestamp()),
+                'open':   round(float(o), 2),
+                'high':   round(float(h), 2),
+                'low':    round(float(l), 2),
+                'close':  round(float(c), 2),
+                'volume': int(v) if v and not (isinstance(v, float) and math.isnan(v)) else 0,
+            })
+
+        return jsonify({'symbol': symbol, 'interval': interval, 'data': data})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/price')
